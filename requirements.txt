@@ -1,0 +1,7 @@
+numpy>=1.21.0
+torch>=2.0.0
+scikit-learn>=1.0.0
+matplotlib>=3.5.0
+tqdm>=4.0.0
+torchvision
+git+https://github.com/Blealtan/efficient-kan.git
