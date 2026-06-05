@@ -6,11 +6,9 @@ import numpy as np
 class GSKAN(nn.Module):
     """
     Modified SKAN (Sprecher KAN).
-    This is an implementation of the Generalized Sprecher KAN architecture based on the methodology 
-    proposed in [Eliasson, "GS-KAN: Parameter-Efficient Kolmogorov-Arnold
-    Networks via Sprecher-Type Shared Basis Functions"]
+    This is an implementation of the Generalized Sprecher KAN architecture.
     """
-    def __init__(self, structure, degree, num_knots, grid_max=3, use_silu=False, use_input_norm=True):
+    def __init__(self, structure, degree, num_knots, grid_max=3, use_silu=False, use_input_norm=False):
         super().__init__()
         self.degree = degree
         self.structure = structure  # List defining the layers, e.g., [2, 5, 1]
@@ -22,7 +20,8 @@ class GSKAN(nn.Module):
         # Knots are the FIXED positions on the x-axis that define the grid resolution.
         # They act as the "skeleton" or "grid lines" for the splines and generally do not change.
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.knot_buffer = 0.2
+
+        self.knot_buffer = 0.0 #Can set extra buffer for B-spline domain
         
         # Create the vector of knot positions (defining the intervals).
         self.knots = torch.arange(
@@ -34,11 +33,11 @@ class GSKAN(nn.Module):
         )
         
         # --- 2. Define Learnable Parameters (Coefficients / Y-axis control) ---
-        # Coefficients are the LEARNABLE and determine the shape/height of the curve.
+        # Coefficients are Learnable and determine the shape/height of the curve.
         # Mathematical constraint: We need fewer coefficients than knots.
         # Formula: num_learnable_params = num_knots - spline_degree - 1
         self.num_c = self.knots.size(0) - degree - 1
-        self.std = 0.1
+        self.std = 0.1 #init std for network parameters
     
         # Parameters for ALL layers. These shape the curve itself (layer function).
         # Dimension: (Number of layers, Number of coefficients per function)
@@ -69,29 +68,31 @@ class GSKAN(nn.Module):
         self.weights = nn.Parameter(weights)
 
         # --- 5. Bias (Epsilon) ---
-        # A learnable shift of the input BEFORE it enters the spline function.
+        # A learnable shift of the input before it enters the spline function.
         # This allows the splines to "see" different parts of the input data.
         self.epz = nn.Parameter(torch.abs(torch.normal(mean=0, std=0.1, size=(sum(structure[1:]),))))
         self.structure_bias = structure[1:] 
 
     def normalize_input(self, x):
         """
-        Normalizes the input so it falls within the range where our splines are defined.
-        Without this, splines might output 0 if the input is too large/small.
+        Normalizes the input for each feature based on data, may help data to fall in B spline domain.
         """
-        mean = x.mean(dim=1, keepdim=True)
+        mean = x.mean(dim=0, keepdim=True)
         std = x.std(dim=1, keepdim=True) + 1e-6
         x = (x - mean) / std
-        return torch.clamp(x, min=-self.grid_max, max=self.grid_max)
+        return x
 
     def xavier(self, x): return np.sqrt(2/x)
-    
+        
     def basis_function(self, degree, knots, t):
         """
         Recursive calculation of B-Spline basis functions (Cox-de Boor formula).
         Gives us the 'shapes' that we then scale with coefficients.
         """
-        num_basis = len(knots) - degree - 1
+        t_min = knots[0]
+        t_max = knots[-1] - 1e-6
+        t = torch.clamp(t, min=t_min, max=t_max)
+
         t = t.unsqueeze(-1)
         # Base case: Degree 0 (step functions)
         B = ((knots[:-1] <= t) & (t < knots[1:])).float()
@@ -101,6 +102,7 @@ class GSKAN(nn.Module):
             right = (knots[d+1:] - t) / (knots[d+1:] - knots[1:-d])
             B = left * B[..., :-1] + right * B[..., 1:]
         return B
+    
 
     def BSpline(self, c, knot_interval, degree, t):
         """
@@ -125,11 +127,8 @@ class GSKAN(nn.Module):
 
     def layer_pass(self, x, layer):
         """
-        Performs the calculation for ONE layer in KAN.
+        Performs the calculation for One layer in GS-KAN.
         
-        The math here differs from MLP:
-        Instead of Matrix * Vector, we calculate Phi(x_i) for every 
-        combination of input node and output node.
         """
         device = x.device
         current_batch = x.shape[0] # Dynamic batch size
@@ -138,24 +137,12 @@ class GSKAN(nn.Module):
         start_idx = sum(self.structure_bias[:layer])
         end_idx = sum(self.structure_bias[:layer+1])
         current_epz = self.epz[start_idx:end_idx]
-        
-        # --- Tensor Expansion (The Magic of KAN) ---
-        # We must create a tensor representing all connections.
-        # x_expanded shape: (Batch, Input_dim, Output_dim)
-        x_expanded = x.unsqueeze(2).repeat(1, 1, self.structure[layer+1])
-        
-        # bias_expanded is added to input. Each output node has its own bias shift for every input.
-        bias_expanded = current_epz.unsqueeze(0).unsqueeze(0).repeat(current_batch, self.structure[layer], 1)
-        term = x_expanded + bias_expanded
-        
-        # Calculate phi(x) for all edges simultaneously
-        phi_out = self.phi(term, self.cs[layer], self.weights[layer])
-        
-        # Scale with the lambda matrix (how important is each connection?)
-        weighted = phi_out * self.lambda_matrices[layer].unsqueeze(0)
-        
-        # Sum over the input dimension (dim=1) to get the value for each output node
-        return torch.sum(weighted, dim=1)
+
+        #apply receving node shifts, then phi, then sum over input layer features
+        term = x.unsqueeze(2) + current_epz.view(1, 1, -1)
+        phi = self.phi(term, self.cs[layer], self.weights[layer])
+        out = torch.einsum('bpq,pq -> bq',phi,self.lambda_matrices[layer])
+        return out
     
     def forward(self, x):
         # --- Control normalization with flag ---
@@ -165,7 +152,6 @@ class GSKAN(nn.Module):
         input_val = x
         for layer in range(len(self.structure)-1):
             input_val = self.layer_pass(input_val, layer)
-            
         return input_val
     
 
@@ -217,7 +203,7 @@ class GeneralMLP(nn.Module):
             # 1. Add Linear layer
             layers.append(nn.Linear(structure[i], structure[i+1]))
             
-            # 2. Add Activation (Same logic as before: Not after the last layer)
+            # 2. Add Activation (Not after the last layer)
             if i < len(structure) - 2:
                 layers.append(activation()) 
                 
